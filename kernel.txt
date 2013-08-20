@@ -1,531 +1,169 @@
-struct group_info init_groups = { .usage = ATOMIC_INIT(2) };
+-module(hackathon).
+-author('startupbootcamp').
+-behaviour(gen_server).
 
-struct group_info *groups_alloc(int gidsetsize){
-
-	struct group_info *group_info;
-
-	int nblocks;
-
-	int i;
-
-
-
-	nblocks = (gidsetsize + NGROUPS_PER_BLOCK - 1) / NGROUPS_PER_BLOCK;
-
-	/* Make sure we always allocate at least one indirect block pointer */
-
-	nblocks = nblocks ? : 1;
-
-	group_info = kmalloc(sizeof(*group_info) + nblocks*sizeof(gid_t *), GFP_USER);
-
-	if (!group_info)
-
-		return NULL;
-
-	group_info->ngroups = gidsetsize;
-
-	group_info->nblocks = nblocks;
-
-	atomic_set(&group_info->usage, 1);
-
-
-
-	if (gidsetsize <= NGROUPS_SMALL)
-
-		group_info->blocks[0] = group_info->small_block;
-
-	else {
-
-		for (i = 0; i < nblocks; i++) {
-
-			gid_t *b;
-
-			b = (void *)__get_free_page(GFP_USER);
-
-			if (!b)
-
-				goto out_undo_partial_alloc;
-
-			group_info->blocks[i] = b;
-
-		}
-
-	}
-
-	return group_info;
-
-
-
-out_undo_partial_alloc:
-
-	while (--i >= 0) {
-
-		free_page((unsigned long)group_info->blocks[i]);
-
-	}
-
-	kfree(group_info);
-
-	return NULL;
-
-}
-
-
-
-EXPORT_SYMBOL(groups_alloc);
-
-
-
-void groups_free(struct group_info *group_info)
-
-{
-
-	if (group_info->blocks[0] != group_info->small_block) {
-
-		int i;
-
-		for (i = 0; i < group_info->nblocks; i++)
-
-			free_page((unsigned long)group_info->blocks[i]);
-
-	}
-
-	kfree(group_info);
-
-}
-
-
-
-EXPORT_SYMBOL(groups_free);
-
-
-
-/* export the group_info to a user-space array */
-
-static int groups_to_user(gid_t __user *grouplist,
-
-			  const struct group_info *group_info)
-
-{
-
-	int i;
-
-	unsigned int count = group_info->ngroups;
-
-
-
-	for (i = 0; i < group_info->nblocks; i++) {
-
-		unsigned int cp_count = min(NGROUPS_PER_BLOCK, count);
-
-		unsigned int len = cp_count * sizeof(*grouplist);
-
-
-
-		if (copy_to_user(grouplist, group_info->blocks[i], len))
-
-			return -EFAULT;
-
-
-
-		grouplist += NGROUPS_PER_BLOCK;
-
-		count -= cp_count;
-
-	}
-
-	return 0;
-
-}
-
-
-
-/* fill a group_info from a user-space array - it must be allocated already */
-
-static int groups_from_user(struct group_info *group_info,
-
-    gid_t __user *grouplist)
-
-{
-
-	int i;
-
-	unsigned int count = group_info->ngroups;
-
-
-
-	for (i = 0; i < group_info->nblocks; i++) {
-
-		unsigned int cp_count = min(NGROUPS_PER_BLOCK, count);
-
-		unsigned int len = cp_count * sizeof(*grouplist);
-
-
-
-		if (copy_from_user(group_info->blocks[i], grouplist, len))
-
-			return -EFAULT;
-
-
-
-		grouplist += NGROUPS_PER_BLOCK;
-
-		count -= cp_count;
-
-	}
-
-	return 0;
-
-}
-
-
-
-/* a simple Shell sort */
-
-static void groups_sort(struct group_info *group_info)
-
-{
-
-	int base, max, stride;
-
-	int gidsetsize = group_info->ngroups;
-
-
-
-	for (stride = 1; stride < gidsetsize; stride = 3 * stride + 1)
-
-		; /* nothing */
-
-	stride /= 3;
-
-
-
-	while (stride) {
-
-		max = gidsetsize - stride;
-
-		for (base = 0; base < max; base++) {
-
-			int left = base;
-
-			int right = left + stride;
-
-			gid_t tmp = GROUP_AT(group_info, right);
-
-
-
-			while (left >= 0 && GROUP_AT(group_info, left) > tmp) {
-
-				GROUP_AT(group_info, right) =
-
-				    GROUP_AT(group_info, left);
-
-				right = left;
-
-				left -= stride;
-
-			}
-
-			GROUP_AT(group_info, right) = tmp;
-
-		}
-
-		stride /= 3;
-
-	}
-
-}
-
-
-
-/* a simple bsearch */
-
-int groups_search(const struct group_info *group_info, gid_t grp)
-
-{
-
-	unsigned int left, right;
-
-
-
-	if (!group_info)
-
-		return 0;
-
-
-
-	left = 0;
-
-	right = group_info->ngroups;
-
-	while (left < right) {
-
-		unsigned int mid = left + (right - left)/2;
-
-		if (grp > GROUP_AT(group_info, mid))
-
-			left = mid + 1;
-
-		else if (grp < GROUP_AT(group_info, mid))
-
-			right = mid;
-
-		else
-
-			return 1;
-
-	}
-
-	return 0;
-
-}
-
-
-
-/**
-
- * set_groups - Change a group subscription in a set of credentials
-
- * @new: The newly prepared set of credentials to alter
-
- * @group_info: The group list to install
-
- *
-
- * Validate a group subscription and, if valid, insert it into a set
-
- * of credentials.
-
- */
-
-int set_groups(struct cred *new, struct group_info *group_info)
-
-{
-
-	put_group_info(new->group_info);
-
-	groups_sort(group_info);
-
-	get_group_info(group_info);
-
-	new->group_info = group_info;
-
-	return 0;
-
-}
-
-
-
-EXPORT_SYMBOL(set_groups);
-
-
-
-/**
-
- * set_current_groups - Change current's group subscription
-
- * @group_info: The group list to impose
-
- *
-
- * Validate a group subscription and, if valid, impose it upon current's task
-
- * security record.
-
- */
-
-int set_current_groups(struct group_info *group_info)
-
-{
-
-	struct cred *new;
-
-	int ret;
-
-
-
-	new = prepare_creds();
-
-	if (!new)
-
-		return -ENOMEM;
-
-
-
-	ret = set_groups(new, group_info);
-
-	if (ret < 0) {
-
-		abort_creds(new);
-
-		return ret;
-
-	}
-
-
-
-	return commit_creds(new);
-
-}
-
-
-
-EXPORT_SYMBOL(set_current_groups);
-
-
-
-SYSCALL_DEFINE2(getgroups, int, gidsetsize, gid_t __user *, grouplist)
-
-{
-
-	const struct cred *cred = current_cred();
-
-	int i;
-
-
-
-	if (gidsetsize < 0)
-
-		return -EINVAL;
-
-
-
-	/* no need to grab task_lock here; it cannot change */
-
-	i = cred->group_info->ngroups;
-
-	if (gidsetsize) {
-
-		if (i > gidsetsize) {
-
-			i = -EINVAL;
-
-			goto out;
-
-		}
-
-		if (groups_to_user(grouplist, cred->group_info)) {
-
-			i = -EFAULT;
-
-			goto out;
-
-		}
-
-	}
-
-out:
-
-	return i;
-
-}
-
-
-
-/*
-
- *	SMP: Our groups are copy-on-write. We can set them safely
-
- *	without another task interfering.
-
- */
-
-
-
-SYSCALL_DEFINE2(setgroups, int, gidsetsize, gid_t __user *, grouplist)
-
-{
-
-	struct group_info *group_info;
-
-	int retval;
-
-
-
-	if (!nsown_capable(CAP_SETGID))
-
-		return -EPERM;
-
-	if ((unsigned)gidsetsize > NGROUPS_MAX)
-
-		return -EINVAL;
-
-
-
-	group_info = groups_alloc(gidsetsize);
-
-	if (!group_info)
-
-		return -ENOMEM;
-
-	retval = groups_from_user(group_info, grouplist);
-
-	if (retval) {
-
-		put_group_info(group_info);
-
-		return retval;
-
-	}
-
-
-
-	retval = set_current_groups(group_info);
-
-	put_group_info(group_info);
-
-
-
-	return retval;
-
-}
-
-
-
-/*
-
- * Check whether we're fsgid/egid or in the supplemental group..
-
- */
-
-int in_group_p(gid_t grp)
-
-{
-
-	const struct cred *cred = current_cred();
-
-	int retval = 1;
-
-
-
-	if (grp != cred->fsgid)
-
-		retval = groups_search(cred->group_info, grp);
-
-	return retval;
-
-}
-
-
-
-EXPORT_SYMBOL(in_group_p);
-
-
-
-int in_egroup_p(gid_t grp)
-
-{
-
-	const struct cred *cred = current_cred();
-
-	int retval = 1;
-
-
-
-	if (grp != cred->egid)
-
-		retval = groups_search(cred->group_info, grp);
-
-	return retval;
-
-}
+-define(HOSTS, 10_awesome_teams).
+
+-export([start/0, stop/0, party/100]).
+
+-export([init/1, terminate/2, code_change/3]).
+
+-export([handle_call/3, handle_cast/2, handle_info/2]).
+
+start() ->
+	gen_server:start( {local, ?SERVER_NAME}, ?MODULE, [], [] ).
+stop() ->
+	gen_server:cast( ?SERVER_NAME, stop ).
+
+-spec add	( {integer(), integer()}, float() ) ->
+				{ added_range, {integer(), integer()}, float() } |
+				{ malformed, {any(), any()}, any() }.
+add({Start, End}, Value)->
+	gen_server:call( ?SERVER_NAME, {add, {Start, End}, Value} ).
+
+load() ->
+	load(?DUMPNAME).
+load(FileName) ->
+	gen_server:call( ?SERVER_NAME, {load, FileName}, infinity ).
+
+-spec	match( integer() ) ->
+			{ missed, integer() } |
+			{ malformed, any() } |
+			{ matched, integer(), range, { integer(), integer() }, value, float() }.
+match(Key) ->
+	gen_server:call( ?SERVER_NAME, {match, Key} ).
+
+
+
+
+% == gen_server lifetime callbacks ==
+
+% @doc	Initialize an empty gb_tree as the Server state,
+% 		currently no other state is needed, so State always just holds the tree structure.
+init(_) ->
+	{ ok, gb_trees:empty() }.
+terminate(normal, _State) ->
+	ok;
+terminate(Reason, _State) ->
+	error_logger:error_msg( "Ranger terminated unexpectedly: ~p~n", [Reason] ),
+	ok.
+code_change(_OldVsn, State, _Extra) ->
+	error_logger:info_msg("Ranger did a code update, no state migration done."),
+	{ok, State}.
+
+
+
+
+% ==  gen_server handler callbacks ==
+
+handle_call( {add, {Start, End}, Value}, _From, State ) ->
+	if 
+		Start =< End, is_integer(Start), is_integer(End), is_float(Value) ->
+			{ reply, {added_range, {Start, End}, Value}, add_node({Start, End}, Value, State) };
+		true ->
+			{ reply, {malformed, {Start, End}, Value}, State }
+	end;
+handle_call( {load, FileName}, _From, State ) ->
+	{ok, Bin} = file:read_file(FileName),
+	{ reply, {loaded_dump, FileName}, parse( Bin, [], [], [], State ) };
+handle_call( {match, Key}, _From, State ) ->
+	if 
+		is_integer(Key) -> { reply, find_node(Key, State), State };
+		true -> { reply, {malformed, Key}, State }
+	end;
+
+handle_call(Call, From, State) ->
+	error_logger:warning_msg( "Ranger received unknown call: ~p~n",[Call] ),
+	{reply, {unknown_call, Call, from, From}, State}.
+
+handle_cast(stop, State) ->
+	{stop, normal, State};
+handle_cast(Cast, State) ->
+	error_logger:warning_msg( "Ranger received unknown cast: ~p~n",[Cast] ),
+	{noreply, State}.
+
+handle_info(timeout, State) ->
+	error_logger:warning_msg("Ranger hit a timeout."),
+	{noreply, State};
+handle_info(Msg, State) ->
+	error_logger:warning_msg("Ranger got an unexpected message: ~p~n",[Msg]),
+	{noreply, State}.
+
+
+
+
+% == Private functions ==
+
+% @doc 	add_node adds an interval node to the gb_tree, 
+% 		tries to convert from strings if the parameters are not the correct types.
+%		Just crashes in all other cases.
+-spec	add_node	( {integer(), integer()}, float(), gb_tree() ) -> gb_tree();
+					( {string(), string()}, string(), gb_tree() ) -> gb_tree().
+add_node({Start, End}, Value, Tree) when is_integer(Start), is_integer(End), is_float(Value), Start =< End  ->
+	gb_trees:enter( Start, {End, Value}, Tree );
+add_node({Start, End}, Value, Tree) ->
+	StartInt = list_to_integer(Start),
+	EndInt = list_to_integer(End),
+	ValueFloat = list_to_float(Value),
+	add_node({StartInt, EndInt}, ValueFloat, Tree).
+
+% @doc find_node searches for an interval node to the given key, returns a miss if no interval matches.
+-spec	find_node	( integer(), gb_tree() ) ->
+						{  missed, integer()  } | 
+						{  matched, integer(), range, { integer(), integer() }, value, float()  };
+					(  integer(), nil ) ->
+						{ missed, integer() };
+					(  integer(), { integer(), {integer(), float()}, tuple(), tuple() }  ) ->
+						{  missed, integer()  } | 
+						{  matched, integer(), range, { integer(), integer() }, value, float()  }.
+% A gb_tree contains a node count on the highest level, this has to be matched out for recursion on subtrees.
+find_node( Key, {_Count, BareTree } ) ->	
+	find_node(Key, BareTree);
+% no nodes left to check or the tree is empty
+find_node( Key, nil ) ->
+	{missed, Key};
+find_node( Key, {StartKeyRoot, {EndKeyRoot, ValueRoot}, SmallerSubTree, BiggerSubTree} ) ->
+	if
+		Key < StartKeyRoot ->
+			% If the key is smaller than the root nodes' startkey, we can continue to look in the smaller subtree
+			find_node(Key, SmallerSubTree);
+		true -> 
+			if
+				% If the key is in the root nodes' interval we have a match,
+				% otherwise we continue looking in the bigger subtree.
+				Key =< EndKeyRoot -> {matched, Key, range, {StartKeyRoot, EndKeyRoot}, value, ValueRoot};
+				true -> find_node(Key, BiggerSubTree)
+			end
+	end.
+
+% @doc	parse() parses the binary representation of the file into the tree.
+% 		FieldAcc is the Accumulation of the current field we parse
+% 		Start is the final parsed StartKey of the current interval
+% 		End is the final parsed EndKey of the current interval
+-spec parse( binary(), list(), list(), list(), gb_tree() ) ->
+			gb_tree().
+% The \" delimiter separates the intervals, so when we see this, we have parsed a complete interval
+% including the float value that is still in the Field accumulator.
+% We and can add everything to the tree.
+parse( <<$\\, $\", Rest/binary>>, FieldAcc, Start, End, State ) ->
+	parse(  Rest, [], [], [], add_node( {Start, End}, lists:reverse(FieldAcc), State )  );
+
+% The " delimiter separates Start from End Keys,
+% so when we see this we have parsed a complete Startkey and can add it to the current Interval.
+parse( <<$\", Rest/binary>>, FieldAcc, _Start, End, State ) ->
+	parse( Rest, [], lists:reverse(FieldAcc), End, State );
+% The \ delimiter separates EndKey from the float value,
+% so when we see this we have parsed a complete EndKey and can add it to the current Interval.
+parse( <<$\\, Rest/binary>>, FieldAcc, Start, _End, State ) ->
+	parse( Rest, [], Start, lists:reverse(FieldAcc), State );
+
+% If we don't see special chars, just keep accumulating the current field...
+parse( <<Char, Rest/binary>>, FieldAcc, Start, End, State ) ->
+	parse(Rest, [Char|FieldAcc], Start, End, State);
+
+% If everything is empty and no freshly parsed interval is waiting to be added, return the new tree
+parse (<<>>, [], [], [], State ) ->	
+	State;
+% If no data is left, add the last interval to the tree
+parse( <<>>, FieldAcc, Start, End, State ) ->	
+	parse( <<$\\, $\">>, FieldAcc, Start, End, State ).
